@@ -1,22 +1,72 @@
-# Bazel Best Practices: Workspace Root vs Subdirectory Workspaces
+# Bazel Troubleshooting Practices (Bzlmod + Multi-Workspace)
 
-## Summary
-When a repository can be built from the root **and** from a subdirectory (e.g., `bindings/cpp`), label resolution changes because `//...` always resolves relative to the **current workspace root**. This document lists practices to keep builds stable for both local development and downstream consumers.
+## Purpose
+This document captures **practical troubleshooting patterns** for Bazel projects using Bzlmod, especially when builds must work both locally (subdirectory workspace) and for downstream consumers (external repository root). The multi-workspace topic is one section among several, not the core.
 
-## Core Principles
-1. **There is exactly one workspace root** at build time. All `//...` labels resolve from that root.
-2. **Downstream consumers always see the repository root** as the external workspace root.
-3. **Subdirectory workspaces are local conveniences** and must not break the external root view.
+## 1) First-Response Checklist (Triage in 5 Minutes)
+- **Read the exact label in the error**: is it `@repo//...` or `//...`? This usually tells you which workspace root is being used.
+- **Confirm workspace root**: `bazel info workspace` and `pwd` in the same shell.
+- **Check module graph**: `bazel mod graph | head -n 80` to see module names and versions.
+- **Check repository mapping**: `bazel mod graph | rg "your-module"` to ensure expected module name/version.
+- **Verify external repo content**: `bazel query @your-module//...` or inspect the downloaded repo in `$(bazel info output_base)/external/`.
 
-## Common Failure Modes
-- A label like `//proto:foo` resolves to different directories depending on the workspace root.
-- Downstream builds fail because a dependency only exists in a subdirectory workspace.
-- Patch-based overrides for external deps work locally but do not propagate to downstream users.
+## 2) Label Resolution Pitfalls (Most Common Root Cause)
+**Symptom**: `no such package '@@repo//proto'` or `//proto` works locally but fails downstream.
 
-## Recommended Patterns
+**Cause**: `//...` always resolves from the current workspace root.
 
-### 1) Use Repository-Aware Labels for Dual-Root Builds
-When a target is consumed by both the repo root and a subdirectory workspace, define a label helper that branches on `native.repository_name()`.
+**Fix patterns**:
+- Use repository-aware labels with `native.repository_name()`.
+- Avoid hardcoding `//proto` or `//bindings/cpp/proto` if both roots must be supported.
+
+## 3) Bzlmod Module Resolution Failures
+**Symptom**: `No repository visible as '@rules_cc'` or wrong version warnings.
+
+**Checks**:
+- Root `MODULE.bazel` exists and is correct.
+- `bazel_dep(name=..., version=...)` declared for each external label referenced in BUILD files.
+- `repo_name` matches actual label usage.
+
+**Fix patterns**:
+- Add missing `bazel_dep` in root `MODULE.bazel`.
+- Align `repo_name` and label usage (do not mix `@protobuf` and `@com_google_protobuf`).
+- Use explicit overrides only when unavoidable, and document them for downstream users.
+
+## 4) Patch Overrides Are Not Transitive
+**Symptom**: Patch fixes work locally but fail in downstream builds.
+
+**Cause**: `single_version_override` applies only in the module graph where it is declared.
+
+**Fix patterns**:
+- Prefer local compatibility fixes instead of patching external deps.
+- If a patch is mandatory, document that downstreams must add the same override.
+
+## 5) CI vs Local Environment Gaps
+**Symptom**: `protoc not found` in CI but works locally.
+
+**Checks**:
+- Does `build.rs` read `PROTOC`? Is it exported in Bazel genrules?
+- Are `PATH`, `PROTOC`, `RUSTUP_HOME`, `CARGO_HOME` aligned between Bazel and Cargo?
+
+**Fix patterns**:
+- Export `PROTOC` explicitly in genrule commands.
+- Pin toolchains in CI; avoid relying on system binaries.
+
+## 6) Artifact Completeness and Publishing
+**Symptom**: Downstream builds fail with missing `BUILD.bazel` or `MODULE.bazel`.
+
+**Checks**:
+- Inspect published artifacts: `zipinfo -1 <artifact>.zip | rg 'MODULE.bazel|BUILD.bazel|bindings/cpp'`.
+- Ensure the tag/version is non-empty in CI.
+
+**Fix patterns**:
+- Fail early in CI if critical files are missing.
+- Ensure module version is set before running publish steps.
+
+## 7) Multi-Workspace Build Compatibility
+**Use this only if the repo must be buildable from both root and subdirectory.**
+
+**Pattern**: repository-aware labels.
 
 ```bzl
 # bindings/cpp/labels.bzl
@@ -25,8 +75,6 @@ def fluss_api_cc_proto_label():
         return "//proto:fluss_api_cc_proto"
     return "//bindings/cpp/proto:fluss_api_cc_proto"
 ```
-
-Then use it in `BUILD.bazel`:
 
 ```bzl
 load(":labels.bzl", "fluss_api_cc_proto_label")
@@ -40,82 +88,70 @@ cc_library(
 )
 ```
 
-### 2) Keep Root `MODULE.bazel` Authoritative
-Downstream users always load the root `MODULE.bazel`. If you keep a subdirectory `MODULE.bazel` for local workspace builds, ensure the dependency block stays synchronized with the root module file.
+## 8) Version Skew Warnings
+**Symptom**: `root module requires X but got Y`.
 
-### 3) Avoid Patch-Only Fixes for External Dependencies
-Patches via `single_version_override` do not propagate to downstream users unless they also configure the same override. Prefer local compatibility fixes (e.g., repository-aware labels) that do not rely on downstream config.
+**Interpretation**:
+- A higher-priority override or downstream dep is pinning a different version.
 
-### 4) Use Root Aliases Sparingly
-Root aliases in `BUILD.bazel` only apply when users build `@repo//:target`. If downstreams use `@repo//bindings/cpp:target`, they bypass root aliases entirely. Do not depend on aliases to fix structural issues.
+**Fix patterns**:
+- Decide if skew is acceptable; if not, override explicitly at the root module.
+- Record approved version ranges in docs or CI checks.
 
-## Minimal Compatibility Checklist
-- Root `MODULE.bazel` is present and accurate.
-- Subdirectory workspace builds do not rely on root-only paths.
-- External repository builds do not rely on subdirectory-only paths.
-- All external dependencies referenced in `BUILD.bazel` are declared in the root `MODULE.bazel`.
+## 9) Cache & Sync Hygiene
+**Symptom**: Changes in module files not reflected in downstream builds.
 
-## Validation Matrix
+**Fix patterns**:
+- `bazel sync --configure` after module updates.
+- `bazel clean --expunge` if repository mapping is stale.
+
+## 10) Output Base Collisions in CI
+**Symptom**: Flaky builds in concurrent CI jobs.
+
+**Fix patterns**:
+- Use job-unique `--output_base`.
+- Avoid sharing output directories across parallel jobs.
+
+## Operational Checklists
+
+### A) Publishing Checklist (Module Artifact)
+- Confirm root `MODULE.bazel` exists and contains all deps used in BUILD files.
+- Ensure tag/version is non-empty before generating metadata.
+- Verify artifact contents:
+  - `MODULE.bazel`
+  - `BUILD.bazel` (if root aliases are used)
+  - `bindings/cpp/**`
+- Run `zipinfo -1` or `tar -tf` and validate file list.
+
+### B) Downstream Integration Checklist
+- Use `@repo//bindings/cpp:target` if you want to bypass root aliases.
+- Run `bazel sync --configure` after updating the module version.
+- If dependency labels fail, inspect `$(bazel info output_base)/external/<repo>/`.
+
+### C) CI Failure Checklist
+- Capture the exact label in the error; classify as root vs subdir.
+- Confirm `bazel info workspace` and `bazel info output_base`.
+- Validate `PROTOC` availability when Cargo is invoked from Bazel.
+- Check for stale module mapping; consider `bazel clean --expunge`.
+
+## FAQ
+
+**Q: Why does `@repo//proto:...` work locally but fail downstream?**
+A: Locally you may be using a subdirectory workspace root where `//proto` exists. Downstream sees the repository root, where `proto/` may not exist.
+
+**Q: Do root `BUILD.bazel` aliases fix subdir path errors?**
+A: Only for labels like `@repo//:target`. They do not affect `@repo//subdir:target` or internal dependencies.
+
+**Q: Why does a patch fix my local build but not downstream?**
+A: `single_version_override` is not transitive. Downstream must repeat the override to see the patch.
+
+**Q: Why do I see version skew warnings?**
+A: Another module or override in the dependency graph is selecting a different version. Decide if skew is acceptable or enforce a pin.
+
+## Quick Validation Matrix
 | Scenario | Command | Expected |
 |---|---|---|
 | Root workspace (local) | `./ci.sh compile` | Success |
 | Subdir workspace (local) | `cd bindings/cpp && bazel build //:fluss_cpp` | Success |
-| Downstream (external) | `bazel build @red-fluss-rust//bindings/cpp:fluss_cpp` | Success |
-
-## When to Add a Root `proto/BUILD.bazel`
-Only if you decide that downstreams should reference `@repo//proto:...` directly. Otherwise, use repository-aware labels to avoid maintaining duplicated packages at the root.
-
-## Additional Lessons Worth Recording
-
-### Root `MODULE.bazel` Is the Only Entry for Bzlmod
-Downstream module resolution only reads the repository root `MODULE.bazel`. Subdirectory `MODULE.bazel` files are local-only and do not affect external consumers.
-
-### External Repository vs Local Workspace Semantics
-External consumers always see the repository root as the workspace root. Any `//...` label used by external builds must resolve correctly from the root, even if local subdirectory builds work.
-
-### Patch Overrides Are Not Transitive
-`single_version_override` or `archive_override` patches only apply in the module graph where they are declared. Downstream users will not inherit them unless they repeat the same overrides.
-
-### Root Aliases Do Not Fix Pathing Errors
-Aliases in the root `BUILD.bazel` are only used by labels like `@repo//:target`. They do not affect `@repo//subdir:target` or internal dependencies.
-
-### CI Script Expectations
-CI publishing scripts commonly assume:
-- A root `MODULE.bazel` exists.
-- Version/tag is non-empty.
-Missing tags may lead to missing `metadata.json` or invalid module metadata paths.
-
-### `protoc` Visibility Across Toolchains
-Rust `build.rs` looks for `PROTOC` in the environment. If Bazel provides `protoc` only via tools, you must export `PROTOC` in the genrule or ensure the environment bridges correctly between Bazel and Cargo.
-
-### `repo_name` Consistency
-If you set `bazel_dep(name = "protobuf", repo_name = "com_google_protobuf")`, all labels must consistently use `@com_google_protobuf//...`. Mixing `@protobuf` and `@com_google_protobuf` causes hard-to-debug load failures.
-
-### Handling Version Skew Warnings
-Warnings like `root module requires X but got Y` indicate an override in the dependency graph. Record when skew is acceptable and when to pin or override explicitly.
-
-### Cache and Sync Hygiene
-After publishing a new module version, downstreams may need:
-- `bazel sync --configure`
-- `bazel clean --expunge` (if repository mapping is stale)
-
-### CI Artifact Completeness Checks
-When publishing zipped modules, verify key files are present:
-- `MODULE.bazel`
-- `BUILD.bazel` (if root aliases are required)
-- `bindings/cpp/**`
-A simple `zipinfo -1` check prevents missing-file regressions.
-
-### Bazel-Cargo Environment Bridging
-If Bazel runs Cargo via genrule, explicitly control:
-- `PROTOC`
-- `PATH`
-- `RUSTUP_HOME` / `CARGO_HOME`
-Otherwise containerized builds may fail while local builds pass.
-
-### Fixed `output_base` in CI
-A fixed `--output_base` path can collide across concurrent jobs. If CI runs multiple builds in parallel, prefer a job-unique output base.
-
-### `.bazelrc` Bzlmod Flags
-`--enable_bzlmod` is global and affects all targets. Document when it is required and avoid mixing legacy `WORKSPACE` assumptions.
+| Downstream (external) | `bazel build @your-module//bindings/cpp:fluss_cpp` | Success |
 
