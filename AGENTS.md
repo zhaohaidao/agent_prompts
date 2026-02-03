@@ -25,6 +25,7 @@
 
 ### 1.2 文档
 * PlanMode生成的计划；CodeMode生成的中间文档或者用户明确要求生成的文档，均使用markdown格式，命名带上主题和日期并保存在.ignore目录
+* 当用户明确提到经验总结时，请保存在~/.codex/knowledge
 * 撰写设计文档时，请遵循设计规范，详情见~/.codex/knowledge/DesignDoc-Conventions.md
 * 画图时，请同时提供ascii和mermaid两种格式
 
