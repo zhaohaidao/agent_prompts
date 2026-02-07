@@ -112,6 +112,28 @@ cc_library(
 - Use job-unique `--output_base`.
 - Avoid sharing output directories across parallel jobs.
 
+## 11) Bazel + Cargo (build.rs) Sandbox Scan Failure
+**症状**：
+- Cargo 报错类似：
+  - `failed to determine list of files in .../bindings/cpp`
+  - `Failed to read the directory at '.../bazel-build/.bazel-output-base/sandbox/...': No such file or directory`
+- 多出现在 Bazel 触发 `cargo build` 的场景（genrule 或 `cargo_build`）。
+
+**根因**：
+- 当 `--output_base` 放在 Cargo crate 目录内（例如 `bindings/cpp/bazel-build/...`），Cargo 会在计算 build script 指纹时遍历 crate 内文件；
+- Bazel sandbox 目录在构建过程中频繁创建/回收，Cargo 扫描时遇到刚被删除的目录，直接失败。
+
+**修复**：
+- 把 Bazel output base 移到 crate 目录外，例如仓库根：
+  - `--output_base="$ROOT_DIR/bazel-build/.bazel-output-base"`
+- 清理旧的 output base，避免残留路径影响：
+  - `rm -rf bindings/cpp/bazel-build`
+  - `rm -rf bazel-build`
+
+**建议**：
+- 避免将 Bazel 的 output base 放在任何 Cargo crate 根目录下。
+- 如果需要稳定输出路径，优先选择仓库根或 `/tmp` 下的独立目录。
+
 ## Operational Checklists
 
 ### A) Publishing Checklist (Module Artifact)
@@ -154,4 +176,3 @@ A: Another module or override in the dependency graph is selecting a different v
 | Root workspace (local) | `./ci.sh compile` | Success |
 | Subdir workspace (local) | `cd bindings/cpp && bazel build //:fluss_cpp` | Success |
 | Downstream (external) | `bazel build @your-module//bindings/cpp:fluss_cpp` | Success |
-
